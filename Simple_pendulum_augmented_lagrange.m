@@ -1,5 +1,4 @@
 %% PC2_Augmented_Lagrange
-
 clear; clc; close all;
 
 %% SYSTEM PARAMETERS 
@@ -142,7 +141,7 @@ for k = 1:N-1
         fwrite(tcpipClient, theta_current, 'double');
         fwrite(tcpipClient, omega_current, 'double');
     catch
-        fprintf('\n✗ TCP transmission error\n');
+        fprintf('\n TCP transmission error\n');
         break;
     end
     
