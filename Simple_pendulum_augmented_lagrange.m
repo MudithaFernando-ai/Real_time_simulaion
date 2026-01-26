@@ -1,6 +1,4 @@
-%% PC2_Augmented_Lagrange_Clean_NoPlots.m
-% PURE AUGMENTED LAGRANGE METHOD IMPLEMENTATION
-% NO PLOTTING - Clean version for thesis
+%% PC2_Augmented_Lagrange
 
 clear; clc; close all;
 
@@ -51,9 +49,9 @@ try
     tcpipClient.OutputBufferSize = 8192;
     tcpipClient.Timeout = 30;
     fopen(tcpipClient);
-    fprintf('✓ Connected to C++ Augmented Lagrange server!\n\n');
+    fprintf(' Connected to C++ Augmented Lagrange server!\n\n');
 catch ME
-    fprintf('✗ Connection failed: %s\n', ME.message);
+    fprintf(' Connection failed: %s\n', ME.message);
     return;
 end
 
@@ -67,8 +65,6 @@ tic;
 fprintf('===============================================\n');
 fprintf('AUGMENTED LAGRANGE SIMULATION STARTED\n');
 fprintf('===============================================\n');
-fprintf('Time | θ [rad] | ω [rad/s] | λ₁ [N] | λ₂ [N]\n');
-fprintf('------------------------------------------------\n');
 
 for k = 1:N-1
     
@@ -150,21 +146,6 @@ for k = 1:N-1
         break;
     end
     
-    % ===============================================
-    % STEP 9: DISPLAY (every 100 samples = 100 ms)
-    % ===============================================
-    if mod(k, 100) == 0
-        t_current = t(k);
-        
-        % Console display
-        fprintf('%.3f | %+.6f | %+.6f | %+.2f | %+.2f\n', ...
-            t_current, theta_current, omega_current, lambda);
-    end
-    
-    % Real-time pacing
-    while toc < t(k+1)
-        pause(0.00001);
-    end
 end
 
 %% CLEANUP
