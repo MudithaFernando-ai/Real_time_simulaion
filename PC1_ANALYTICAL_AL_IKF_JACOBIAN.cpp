@@ -10,6 +10,7 @@
 //for run
 // ./pendulum_server
 
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -49,13 +51,13 @@ struct LogData {
     std::vector<double> cycle_us;
 };
 
-LogData logData;
+static LogData logData;
 
 // ------------------------------------------------------
-// Utility
+// Utility: endian swap (MATLAB <-> C++)
 // ------------------------------------------------------
 
-double swapDouble(double value) {
+static double swapDouble(double value) {
     uint64_t temp;
     std::memcpy(&temp, &value, sizeof(double));
     temp = ((temp & 0xFF00000000000000ULL) >> 56) |
@@ -71,36 +73,37 @@ double swapDouble(double value) {
     return result;
 }
 
-// ------------------------------------------------------
-// Augmented Lagrange step (similar to MATLAB model)
-// ------------------------------------------------------
+// ======================================================
+// Augmented Lagrange: solve for qddot given q, qdot
+// (matches MATLAB augmentedLagrangeODE internal steps) [file:1]
+// ======================================================
 
-void augmentedLagrangeStep(ALState &state, double dt,
-                           double m_A, double g, double L, double I_theta,
-                           double &lam1_out, double &lam2_out) {
-    double *q    = state.q;
-    double *qdot = state.qdot;
-    double *qddot= state.qddot;
-
+static void solveAL_qddot(const double q[3], const double qdot[3],
+                          double m_A, double g, double L, double I_theta,
+                          double qddot_out[3])
+{
+    // M = diag(m_A, m_A, I_theta)
     double M11 = m_A, M22 = m_A, M33 = I_theta;
 
-    double C11 = 1.0,  C12 = 0.0,             C13 = (L/2.0)*std::sin(q[2]);
-    double C21 = 0.0,  C22 = 1.0,             C23 = (L/2.0)*std::cos(q[2]);
+    // Cq = [1, 0, (L/2)sin(theta); 0, 1, (L/2)cos(theta)] [file:1]
+    double C11 = 1.0,  C12 = 0.0,            C13 = (L/2.0)*std::sin(q[2]);
+    double C21 = 0.0,  C22 = 1.0,            C23 = (L/2.0)*std::cos(q[2]);
 
-    // Generalized forces: gravity only, no external torque
+    // Qe = [0; -m_A*g; 0] [file:1]
     double Qe1 = 0.0;
     double Qe2 = -m_A * g;
     double Qe3 = 0.0;
 
-    // Quadratic velocity terms
+    // Qv_theta = -(omega^2)*(L/2)*cos(theta) [file:1]
     double Qv1 = 0.0;
     double Qv2 = 0.0;
     double Qv3 = -(qdot[2]*qdot[2])*(L/2.0)*std::cos(q[2]);
 
-    // Constraint-second-derivative terms
+    // Cqq_qdot2 = [omega^2*(L/2)*cos(theta); -omega^2*(L/2)*sin(theta)] [file:1]
     double cqq1 = (qdot[2]*qdot[2])*(L/2.0)*std::cos(q[2]);
     double cqq2 = -(qdot[2]*qdot[2])*(L/2.0)*std::sin(q[2]);
 
+    // 5x5 augmented system [ M Cq^T; Cq 0 ] [qddot; lambda] = [Qe+Qv; -Cqq] [file:1]
     double A[5][5] = {
         {M11,  0.0,  0.0,  C11, C21},
         {0.0,  M22,  0.0,  C12, C22},
@@ -117,29 +120,20 @@ void augmentedLagrangeStep(ALState &state, double dt,
         -cqq2
     };
 
-    // Gaussian elimination with partial pivoting
+    // Gaussian elimination (partial pivoting)
     for (int i = 0; i < 5; ++i) {
         int pivot = i;
         for (int k = i + 1; k < 5; ++k) {
             if (std::fabs(A[k][i]) > std::fabs(A[pivot][i])) pivot = k;
         }
         if (pivot != i) {
-            for (int j = 0; j < 5; ++j) {
-                double tmp = A[i][j];
-                A[i][j] = A[pivot][j];
-                A[pivot][j] = tmp;
-            }
-            double tmpb = b[i];
-            b[i] = b[pivot];
-            b[pivot] = tmpb;
+            for (int j = 0; j < 5; ++j) std::swap(A[i][j], A[pivot][j]);
+            std::swap(b[i], b[pivot]);
         }
-
         if (std::fabs(A[i][i]) < 1e-12) continue;
-
         for (int k = i + 1; k < 5; ++k) {
             double factor = A[k][i] / A[i][i];
-            for (int j = i; j < 5; ++j)
-                A[k][j] -= factor * A[i][j];
+            for (int j = i; j < 5; ++j) A[k][j] -= factor * A[i][j];
             b[k] -= factor * b[i];
         }
     }
@@ -147,119 +141,112 @@ void augmentedLagrangeStep(ALState &state, double dt,
     double sol[5];
     for (int i = 4; i >= 0; --i) {
         sol[i] = b[i];
-        for (int j = i + 1; j < 5; ++j)
-            sol[i] -= A[i][j] * sol[j];
-        if (std::fabs(A[i][i]) > 1e-12)
-            sol[i] /= A[i][i];
+        for (int j = i + 1; j < 5; ++j) sol[i] -= A[i][j] * sol[j];
+        if (std::fabs(A[i][i]) > 1e-12) sol[i] /= A[i][i];
     }
 
-    qddot[0] = sol[0];
-    qddot[1] = sol[1];
-    qddot[2] = sol[2];
-    lam1_out  = sol[3];
-    lam2_out  = sol[4];
-
-    qdot[0] += qddot[0] * dt;
-    qdot[1] += qddot[1] * dt;
-    qdot[2] += qddot[2] * dt;
-
-    q[0] += qdot[0] * dt;
-    q[1] += qdot[1] * dt;
-    q[2] += qdot[2] * dt;
+    qddot_out[0] = sol[0];
+    qddot_out[1] = sol[1];
+    qddot_out[2] = sol[2];
 }
 
-void rk4Step(ALState &state, double dt,
-             double m_A, double g, double L, double I_theta) {
-    double lam1, lam2;
-    augmentedLagrangeStep(state, dt, m_A, g, L, I_theta, lam1, lam2);
+// ODE: dydt = [qdot; qddot] (MATLAB augmentedLagrangeODE) [file:1]
+static void augmentedLagrangeODE(const double y[6],
+                                 double m_A, double g, double L, double I_theta,
+                                 double dydt[6])
+{
+    double q[3]    = {y[0], y[1], y[2]};
+    double qdot[3] = {y[3], y[4], y[5]};
+    double qddot[3];
+
+    solveAL_qddot(q, qdot, m_A, g, L, I_theta, qddot);
+
+    dydt[0] = qdot[0];
+    dydt[1] = qdot[1];
+    dydt[2] = qdot[2];
+    dydt[3] = qddot[0];
+    dydt[4] = qddot[1];
+    dydt[5] = qddot[2];
 }
 
-// ------------------------------------------------------
-// Alpha model from IKF theta & omega (AL-consistent)
-// For a uniform rod of length L, mass m_A, pivot at one end:
-// I_pivot = I_theta + m_A (L/2)^2
-// Gravity torque about pivot: tau_g = m_A g (L/2) cos(theta)
-// alpha = tau_g / I_pivot
-// ------------------------------------------------------
+// True RK4 step (same structure as MATLAB RK4 loop) [file:1]
+static void rk4Step(ALState &state, double dt,
+                    double m_A, double g, double L, double I_theta)
+{
+    double y[6] = {
+        state.q[0], state.q[1], state.q[2],
+        state.qdot[0], state.qdot[1], state.qdot[2]
+    };
 
-double alphaFromThetaOmega(double theta, double omega,
-                           double g, double L,
-                           double m_A, double I_theta) {
-    double I_pivot = I_theta + m_A * (L*L) / 4.0;
-    double tau_g   = m_A * g * (L / 2.0) * std::cos(theta);
-    return tau_g / I_pivot;
+    double k1[6], k2[6], k3[6], k4[6], yt[6];
+
+    augmentedLagrangeODE(y, m_A, g, L, I_theta, k1);
+
+    for (int i = 0; i < 6; ++i) yt[i] = y[i] + 0.5 * dt * k1[i];
+    augmentedLagrangeODE(yt, m_A, g, L, I_theta, k2);
+
+    for (int i = 0; i < 6; ++i) yt[i] = y[i] + 0.5 * dt * k2[i];
+    augmentedLagrangeODE(yt, m_A, g, L, I_theta, k3);
+
+    for (int i = 0; i < 6; ++i) yt[i] = y[i] + dt * k3[i];
+    augmentedLagrangeODE(yt, m_A, g, L, I_theta, k4);
+
+    for (int i = 0; i < 6; ++i) {
+        y[i] = y[i] + (dt / 6.0) * (k1[i] + 2.0*k2[i] + 2.0*k3[i] + k4[i]);
+    }
+
+    // write back q and qdot
+    state.q[0] = y[0]; state.q[1] = y[1]; state.q[2] = y[2];
+    state.qdot[0] = y[3]; state.qdot[1] = y[4]; state.qdot[2] = y[5];
+
+    // update qddot at the updated state for logging
+    double qddot_now[3];
+    double q_now[3]    = {state.q[0], state.q[1], state.q[2]};
+    double qdot_now[3] = {state.qdot[0], state.qdot[1], state.qdot[2]};
+    solveAL_qddot(q_now, qdot_now, m_A, g, L, I_theta, qddot_now);
+    state.qddot[0] = qddot_now[0];
+    state.qddot[1] = qddot_now[1];
+    state.qddot[2] = qddot_now[2];
 }
 
-// ------------------------------------------------------
-// IKF Predict: x = [theta, omega, alpha]
-// alpha_ikf from theta_ikf & omega_ikf (AL-consistent)
-// ------------------------------------------------------
+// ======================================================
+// IKF: constant-acceleration model + analytical Jacobian
+// alpha overwritten after correction by dOmega/dt
+// ======================================================
 
-void ikfPredict(IKFState &ikf, double dt,
-                double g, double L,
-                double m_A, double I_theta) {
-    double theta = ikf.x[0];
-    double omega = ikf.x[1];
+static void ikfPredict(IKFState &ikf, double dt)
+{
+    const double theta = ikf.x[0];
+    const double omega = ikf.x[1];
+    const double alpha = ikf.x[2];
 
-    double alpha_model = alphaFromThetaOmega(theta, omega, g, L, m_A, I_theta);
+    // Prediction (constant acceleration)
+    ikf.x_pred[0] = theta + omega * dt + 0.5 * alpha * dt * dt;
+    ikf.x_pred[1] = omega + alpha * dt;
+    ikf.x_pred[2] = alpha;
 
-    double theta_pred = theta + omega * dt + 0.5 * alpha_model * dt * dt;
-    double omega_pred = omega + alpha_model * dt;
-    double alpha_pred = alpha_model;
+    // Analytical Jacobian for this f(x)
+    // x_next = [theta + omega*dt + 0.5*alpha*dt^2;
+    //           omega + alpha*dt;
+    //           alpha]
+    double F[3][3] = {
+        {1.0, dt, 0.5*dt*dt},
+        {0.0, 1.0, dt},
+        {0.0, 0.0, 1.0}
+    };
 
-    ikf.x_pred[0] = theta_pred;
-    ikf.x_pred[1] = omega_pred;
-    ikf.x_pred[2] = alpha_pred;
-
-    // Linearized F = d(x_pred)/d(x)
-    // Here we approximate:
-    //   alpha = alpha(theta)  (no explicit omega, alpha dependence)
-    // I_pivot constant → d(alpha)/d(theta) = -(m_A*g*(L/2)/I_pivot)*sin(theta)
-
-    double I_pivot = I_theta + m_A * (L*L) / 4.0;
-    double d_alpha_dtheta = -(m_A * g * (L / 2.0) / I_pivot) * std::sin(theta);
-    double d_alpha_domega = 0.0;
-    double d_alpha_dalpha = 0.0; // alpha has no direct dependence on previous alpha
-
-    // Chain rule for theta_pred, omega_pred:
-    // theta_pred = theta + omega*dt + 0.5*alpha(theta)*dt^2
-    // omega_pred = omega + alpha(theta)*dt
-
-    double F[3][3];
-
-    // d(theta_pred)/d(theta) = 1 + 0.5 * d_alpha_dtheta * dt^2
-    // d(theta_pred)/d(omega) = dt + 0.5 * d_alpha_domega * dt^2 ≈ dt
-    // d(theta_pred)/d(alpha) = 0.5 * d_alpha_dalpha * dt^2 = 0
-    F[0][0] = 1.0 + 0.5 * d_alpha_dtheta * dt * dt;
-    F[0][1] = dt;
-    F[0][2] = 0.0;
-
-    // d(omega_pred)/d(theta) = d_alpha_dtheta * dt
-    // d(omega_pred)/d(omega) = 1 + d_alpha_domega * dt ≈ 1
-    // d(omega_pred)/d(alpha) = d_alpha_dalpha * dt = 0
-    F[1][0] = d_alpha_dtheta * dt;
-    F[1][1] = 1.0;
-    F[1][2] = 0.0;
-
-    // alpha_pred = alpha(theta_pred, omega_pred) is nonlinear.
-    // For a simple analytic F we approximate with current theta:
-    F[2][0] = d_alpha_dtheta;
-    F[2][1] = d_alpha_domega;
-    F[2][2] = 1.0; // treat alpha as approximately first-order
-
+    // P = F P F^T + Q
     double P_old[3][3];
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
             P_old[i][j] = ikf.P[i][j];
 
-    // FP = F * P
     double FP[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
             for (int k = 0; k < 3; ++k)
                 FP[i][j] += F[i][k] * P_old[k][j];
 
-    // P_pred = FP * F^T
     double P_pred[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
@@ -277,34 +264,16 @@ void ikfPredict(IKFState &ikf, double dt,
             ikf.P[i][j] = P_pred[i][j] + Q[i][j];
 }
 
-// ------------------------------------------------------
-// IKF Update: measurement z = [theta_m, omega_m]
-// Correction only in theta_ikf & omega_ikf; alpha_ikf re-computed
-// ------------------------------------------------------
+static void ikfUpdate_thetaOmegaOnly(IKFState &ikf, double z_theta, double z_omega)
+{
+    // Measurement z = [theta_m, omega_m], H = [1 0 0; 0 1 0]
+    double H[2][3] = { {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0} };
+    double R[2][2] = { {1e-8, 0.0}, {0.0, 1e-7} };
 
-void ikfUpdate(IKFState &ikf,
-               double z_theta, double z_omega,
-               double g, double L,
-               double m_A, double I_theta) {
-    double z[2] = {z_theta, z_omega};
+    double y0 = z_theta - (H[0][0]*ikf.x_pred[0] + H[0][1]*ikf.x_pred[1] + H[0][2]*ikf.x_pred[2]);
+    double y1 = z_omega - (H[1][0]*ikf.x_pred[0] + H[1][1]*ikf.x_pred[1] + H[1][2]*ikf.x_pred[2]);
 
-    // H: 2x3, measuring theta and omega
-    double H[2][3] = {
-        {1.0, 0.0, 0.0},
-        {0.0, 1.0, 0.0}
-    };
-
-    double R[2][2] = {
-        {1e-8, 0.0},
-        {0.0,  1e-7}
-    };
-
-    // y = z - H x_pred
-    double y[2];
-    y[0] = z[0] - (H[0][0]*ikf.x_pred[0] + H[0][1]*ikf.x_pred[1] + H[0][2]*ikf.x_pred[2]);
-    y[1] = z[1] - (H[1][0]*ikf.x_pred[0] + H[1][1]*ikf.x_pred[1] + H[1][2]*ikf.x_pred[2]);
-
-    // S = H P H^T + R  (2x2)
+    // S = H P H^T + R
     double S[2][2] = {{0,0},{0,0}};
     for (int i = 0; i < 2; ++i)
         for (int j = 0; j < 2; ++j) {
@@ -316,59 +285,49 @@ void ikfUpdate(IKFState &ikf,
         }
 
     double detS = S[0][0]*S[1][1] - S[0][1]*S[1][0];
+    if (std::fabs(detS) < 1e-18) detS = (detS >= 0 ? 1e-18 : -1e-18);
+
     double invS[2][2];
     invS[0][0] =  S[1][1] / detS;
     invS[0][1] = -S[0][1] / detS;
     invS[1][0] = -S[1][0] / detS;
     invS[1][1] =  S[0][0] / detS;
 
-    // P H^T (3x2)
+    // PHT = P * H^T (H selects first two states)
     double PHT[3][2] = {{0,0},{0,0},{0,0}};
     for (int i = 0; i < 3; ++i) {
         PHT[i][0] = ikf.P[i][0];
         PHT[i][1] = ikf.P[i][1];
     }
 
-    // K = PHT * invS (3x2)
+    // K = PHT * invS
     double K[3][2] = {{0,0},{0,0},{0,0}};
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 2; ++j)
             for (int k = 0; k < 2; ++k)
                 K[i][j] += PHT[i][k] * invS[k][j];
 
-    // x = x_pred + K*y
-    double x_new[3];
-    for (int i = 0; i < 3; ++i) {
-        x_new[i] = ikf.x_pred[i]
-                 + K[i][0] * y[0]
-                 + K[i][1] * y[1];
-    }
+    // x = x_pred + K*y (but do not correct alpha here)
+    double theta_new = ikf.x_pred[0] + K[0][0]*y0 + K[0][1]*y1;
+    double omega_new = ikf.x_pred[1] + K[1][0]*y0 + K[1][1]*y1;
+    double alpha_new = ikf.x_pred[2];
 
-    // Enforce alpha_ikf from theta_ikf & omega_ikf (ignore MATLAB alpha)
-    double theta_corr = x_new[0];
-    double omega_corr = x_new[1];
-    double alpha_corr = alphaFromThetaOmega(theta_corr, omega_corr, g, L, m_A, I_theta);
-    x_new[2] = alpha_corr;
-
-    for (int i = 0; i < 3; ++i)
-        ikf.x[i] = x_new[i];
+    ikf.x[0] = theta_new;
+    ikf.x[1] = omega_new;
+    ikf.x[2] = alpha_new;
 
     // P = (I - K H) P
-    double I_KH[3][3] = {
-        {1.0, 0.0, 0.0},
-        {0.0, 1.0, 0.0},
-        {0.0, 0.0, 1.0}
-    };
-
     double KH[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
             for (int k = 0; k < 2; ++k)
                 KH[i][j] += K[i][k] * H[k][j];
 
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            I_KH[i][j] -= KH[i][j];
+    double I_KH[3][3] = {
+        {1.0 - KH[0][0],    -KH[0][1],    -KH[0][2]},
+        {   -KH[1][0], 1.0 - KH[1][1],    -KH[1][2]},
+        {   -KH[2][0],    -KH[2][1], 1.0 - KH[2][2]}
+    };
 
     double P_new[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
     for (int i = 0; i < 3; ++i)
@@ -381,12 +340,12 @@ void ikfUpdate(IKFState &ikf,
             ikf.P[i][j] = P_new[i][j];
 }
 
-// ------------------------------------------------------
+// ======================================================
 // CSV
-// ------------------------------------------------------
+// ======================================================
 
-void saveToCSV() {
-    std::ofstream csv("AL_IKF_results.csv");
+static void saveToCSV() {
+    std::ofstream csv("AL_IKF_results_ANAL_RK4_domega.csv");
     csv << "Time,Theta_MATLAB,Omega_MATLAB,Alpha_MATLAB,"
            "Theta_CPP,Omega_CPP,Alpha_CPP,"
            "Theta_IKF,Omega_IKF,Alpha_IKF,CycleTime_us\n";
@@ -408,15 +367,15 @@ void saveToCSV() {
 
     csv.close();
     std::cout << "\nSaved " << logData.time.size()
-              << " samples to AL_IKF_results.csv\n";
+              << " samples to AL_IKF_results_ANAL_RK4_domega.csv\n";
 }
 
-// ------------------------------------------------------
+// ======================================================
 // MAIN
-// ------------------------------------------------------
+// ======================================================
 
 int main() {
-    // System parameters (match MATLAB)
+    // System parameters (match MATLAB) [file:1]
     const double L   = 1.0;
     const double w   = 0.1;
     const double h   = 0.1;
@@ -426,23 +385,20 @@ int main() {
     const double m_A     = rho * L * w * h;
     const double I_theta = m_A * L * L / 12.0;
 
-    const double dt_tcp = 0.001;        // 1 kHz from MATLAB
-    const double dt_sub = dt_tcp / 10;  // AL substep
+    const double dt_tcp = 0.001;        // 1 kHz
+    const double dt_sub = dt_tcp / 10;  // AL plant substep count = 10
 
-    // Initialize AL model state (similar to MATLAB)
-    ALState al_state{};
-    al_state.q[0]    = 0.1;
-    al_state.q[1]    = 0.0;
-    al_state.q[2]    = PI / 3.0;
-    al_state.qdot[0] = 0.0;
-    al_state.qdot[1] = 0.0;
-    al_state.qdot[2] = 0.5;
+    // Init C++ AL plant
+    ALState al{};
+    al.q[0] = 0.1;  al.q[1] = 0.0;  al.q[2] = PI/3.0;
+    al.qdot[0] = 0.0; al.qdot[1] = 0.0; al.qdot[2] = 0.5;
+    al.qddot[0] = al.qddot[1] = al.qddot[2] = 0.0;
 
-    // Initialize IKF state
+    // Init IKF
     IKFState ikf{};
-    ikf.x[0] = PI / 3.0; // theta_ikf
-    ikf.x[1] = 0.5;      // omega_ikf
-    ikf.x[2] = alphaFromThetaOmega(ikf.x[0], ikf.x[1], g, L, m_A, I_theta);
+    ikf.x[0] = PI/3.0;
+    ikf.x[1] = 0.5;
+    ikf.x[2] = 0.0;   // will be overwritten by dOmega/dt after first update
 
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
@@ -451,8 +407,12 @@ int main() {
     ikf.P[1][1] = 1e-3;
     ikf.P[2][2] = 1e-2;
 
+    // For alpha_ikf = d(omega_ikf_corrected)/dt
+    double omega_prev_corr = 0.0;
+    bool have_prev = false;
+
     // TCP server
-    int serverPort = 5000;
+    const int serverPort = 5000;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         std::cerr << "Socket creation failed\n";
@@ -480,13 +440,13 @@ int main() {
         return -1;
     }
 
-    std::cout << "MATLAB connected! AL + IKF [theta, omega, alpha]\n\n";
+    std::cout << "MATLAB connected! AL(RK4) + IKF(analytical F) + alpha=dOmega/dt\n\n";
 
     int k = 0;
     while (true) {
         auto t_start = std::chrono::high_resolution_clock::now();
 
-        // MATLAB sends theta_m, omega_m, alpha_m (3 doubles)
+        // MATLAB sends theta_m, omega_m, alpha_m (3 doubles) [file:1]
         double theta_m, omega_m, alpha_m;
         if (recv(client, &theta_m, sizeof(double), 0) <= 0) break;
         if (recv(client, &omega_m, sizeof(double), 0) <= 0) break;
@@ -499,44 +459,53 @@ int main() {
         ++k;
         double t = k * dt_tcp;
 
-        // C++ AL model substeps (independent of MATLAB)
+        // 1) C++ AL plant: RK4 integration (10 substeps)
         for (int i = 0; i < 10; ++i) {
-            rk4Step(al_state, dt_sub, m_A, g, L, I_theta);
+            rk4Step(al, dt_sub, m_A, g, L, I_theta);
         }
 
-        // IKF: predict + update (correction only in theta_ikf & omega_ikf)
-        ikfPredict(ikf, dt_tcp, g, L, m_A, I_theta);
-        ikfUpdate(ikf, theta_m, omega_m, g, L, m_A, I_theta);
+        // 2) IKF predict/update (correct theta, omega only)
+        ikfPredict(ikf, dt_tcp);
+        ikfUpdate_thetaOmegaOnly(ikf, theta_m, omega_m);
 
-        // Log everything
+        // 3) alpha_ikf from corrected omega derivative
+        double omega_corr = ikf.x[1];
+        double alpha_ikf = 0.0;
+        if (!have_prev) {
+            alpha_ikf = 0.0;
+            omega_prev_corr = omega_corr;
+            have_prev = true;
+        } else {
+            alpha_ikf = (omega_corr - omega_prev_corr) / dt_tcp;
+            omega_prev_corr = omega_corr;
+        }
+        ikf.x[2] = alpha_ikf;
+
+        // Log
         logData.time.push_back(t);
 
         logData.theta_m.push_back(theta_m);
         logData.omega_m.push_back(omega_m);
         logData.alpha_m.push_back(alpha_m);
 
-        logData.theta_cpp.push_back(al_state.q[2]);
-        logData.omega_cpp.push_back(al_state.qdot[2]);
-        logData.alpha_cpp.push_back(al_state.qddot[2]);
+        logData.theta_cpp.push_back(al.q[2]);
+        logData.omega_cpp.push_back(al.qdot[2]);
+        logData.alpha_cpp.push_back(al.qddot[2]);
 
         logData.theta_ikf.push_back(ikf.x[0]);
         logData.omega_ikf.push_back(ikf.x[1]);
         logData.alpha_ikf.push_back(ikf.x[2]);
 
         auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                         std::chrono::high_resolution_clock::now() - t_start)
-                         .count();
+                         std::chrono::high_resolution_clock::now() - t_start).count();
         logData.cycle_us.push_back(static_cast<double>(dt_us));
 
         if (k % 1000 == 0) {
-            std::printf("t=%.3f: "
-                        "θm=%.4f, ωm=%.4f, αm=%.4f | "
-                        "θcpp=%.4f, ωcpp=%.4f, αcpp=%.4f | "
-                        "θikf=%.4f, ωikf=%.4f, αikf=%.4f\n",
+            std::printf("t=%.3f: θm=%.4f ωm=%.4f αm=%.4f | θikf=%.4f ωikf=%.4f αikf=%.4f | αcpp=%.4f\n",
                         t,
                         theta_m, omega_m, alpha_m,
-                        al_state.q[2], al_state.qdot[2], al_state.qddot[2],
-                        ikf.x[0], ikf.x[1], ikf.x[2]);
+                        ikf.x[0], ikf.x[1], ikf.x[2],
+                        al.qddot[2]);
         }
     }
 
