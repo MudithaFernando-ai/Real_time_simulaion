@@ -1,6 +1,11 @@
-// PC1_AL_IKF_NUMERICAL_JACOBIAN.cpp
-// Simple Pendulum Simulation + Indirect Kalman Filter (NUMERICAL JACOBIAN)
-// g++ -std=c++11 -O3 IKF_correct.cpp -o pendulum_server
+// PC1_Numerical model
+// C++ Augmented Lagrange model + IKF for simple pendulum
+// - C++ has its own pendulum model as simulation model
+// - MATLAB sends (theta_m, omega_m, alpha_m) at 1 kHz acts as physical system
+// - IKF state: x = [theta_ikf, omega_ikf, alpha_ikf]
+//for compile
+// g++ -std=c++11 -O3 IKF_Num_17_2_2026.cpp -o pendulum_server
+//for run
 // ./pendulum_server
 
 #include <iostream>
@@ -8,45 +13,54 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
-#include <cstring>
 #include <cmath>
+#include <cstring>
+#include <cstdio>
+#include <algorithm>
+#include <cstdint>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 const double PI = 3.14159265358979323846;
-const double EPS = 1e-8;  // Finite difference step size for numerical Jacobian [web:20][web:9]
 
-// =====================================================
-// DATA STRUCTURES - EXTENDED IKF STATE (unchanged)
-// =====================================================
+// ------------------------------------------------------
+// Data structures
+// ------------------------------------------------------
 
+// Augmented lagrange State : z = [z1, z2, z3] = [Rx, Ry, theta]
 struct ALState {
-    double q[3];      // [Rx, Ry, theta]
-    double qdot[3];   // [Rx_dot, Ry_dot, theta_dot]
-    double qddot[3];  // [Rx_ddot, Ry_ddot, theta_ddot]
+    double z[3];          // z  = [z1, z2, z3]
+    double z_dot[3];      // ż = [z1_dot, z2_dot, z3_dot]
+    double z_ddot[3];     // z̈ = [z1_ddot, z2_ddot, z3_ddot]
 };
 
+// IKFState = error-state filter state x = [z̃_i, ż̃_i, z̈̃_i] [Eq. (17)]
 struct IKFState {
-    double x[3];        // [theta, omega, alpha] - EXTENDED 3x3 state
-    double P[3][3];     // 3x3 covariance matrix
-    double x_pred[3];   // Predicted state [theta-, omega-, alpha-]
+    double x[3];          // x_k      (corrected)      [Eq. (25)], x = [dz_i, dz_i_dot, dz_i_ddot]
+    double P[3][3];       // P_k      (corrected)      [Eq. (26)]
+    double x_pred[3];     // x^-_{k+1} (predicted)     [Eq. (18)]
+    double P_pred[3][3];  // P^-_{k+1} (predicted)     [Eq. (19)]
 };
 
 struct LogData {
     std::vector<double> time;
-    std::vector<double> theta_matlab, omega_matlab, alpha_matlab, torque_matlab;
+    std::vector<double> theta_m, omega_m, alpha_m;
     std::vector<double> theta_cpp, omega_cpp, alpha_cpp;
     std::vector<double> theta_ikf, omega_ikf, alpha_ikf;
-    std::vector<double> cycle_time_us;
+    std::vector<double> cycle_us;
 };
 
-LogData logData;
+static LogData logData;
 
-double swapDouble(double value) {
+// ------------------------------------------------------
+// Utility: endian swap (MATLAB <-> C++)
+// ------------------------------------------------------
+
+static double swapDouble(double value) {
     uint64_t temp;
-    memcpy(&temp, &value, sizeof(double));
+    std::memcpy(&temp, &value, sizeof(double));
     temp = ((temp & 0xFF00000000000000ULL) >> 56) |
            ((temp & 0x00FF000000000000ULL) >> 40) |
            ((temp & 0x0000FF0000000000ULL) >> 24) |
@@ -56,117 +70,44 @@ double swapDouble(double value) {
            ((temp & 0x000000000000FF00ULL) << 40) |
            ((temp & 0x00000000000000FFULL) << 56);
     double result;
-    memcpy(&result, &temp, sizeof(double));
+    std::memcpy(&result, &temp, sizeof(double));
     return result;
 }
 
-// =====================================================
-// STATE TRANSITION FUNCTION f(x, dt) -> x_next [web:7]
-// =====================================================
+// ======================================================
+// Augmented Lagrange
+// ======================================================
 
-void stateTransition(double x_in[3], double dt, double g, double L, double x_out[3]) {
-    double theta = x_in[0];
-    double omega = x_in[1];
-    double alpha = x_in[2];
-
-    // RK4 integration for prediction (same as before)
-    double sin_theta = sin(theta);
-    double cos_theta = cos(theta);
-
-    // k1
-    double k1_theta = omega;
-    double k1_omega = alpha;
-    double jerk = -(3.0*g/L) * sin_theta * alpha - (3.0*g/L) * cos_theta * omega * omega;
-    double k1_alpha = jerk;
-
-    // k2
-    double theta2 = theta + 0.5*dt*k1_theta;
-    double omega2 = omega + 0.5*dt*k1_omega;
-    double alpha2 = alpha + 0.5*dt*k1_alpha;
-    double sin_theta2 = sin(theta2); double cos_theta2 = cos(theta2);
-    double k2_theta = omega2;
-    double k2_omega = alpha2;
-    double jerk2 = -(3.0*g/L) * sin_theta2 * alpha2 - (3.0*g/L) * cos_theta2 * omega2 * omega2;
-    double k2_alpha = jerk2;
-
-    // k3
-    double theta3 = theta + 0.5*dt*k2_theta;
-    double omega3 = omega + 0.5*dt*k2_omega;
-    double alpha3 = alpha + 0.5*dt*k2_alpha;
-    double sin_theta3 = sin(theta3); double cos_theta3 = cos(theta3);
-    double k3_theta = omega3;
-    double k3_omega = alpha3;
-    double jerk3 = -(3.0*g/L) * sin_theta3 * alpha3 - (3.0*g/L) * cos_theta3 * omega3 * omega3;
-    double k3_alpha = jerk3;
-
-    // k4
-    double theta4 = theta + dt*k3_theta;
-    double omega4 = omega + dt*k3_omega;
-    double alpha4 = alpha + dt*k3_alpha;
-    double sin_theta4 = sin(theta4); double cos_theta4 = cos(theta4);
-    double k4_theta = omega4;
-    double k4_omega = alpha4;
-    double jerk4 = -(3.0*g/L) * sin_theta4 * alpha4 - (3.0*g/L) * cos_theta4 * omega4 * omega4;
-    double k4_alpha = jerk4;
-
-    // RK4 update
-    x_out[0] = theta + (dt/6.0)*(k1_theta + 2*k2_theta + 2*k3_theta + k4_theta);
-    x_out[1] = omega + (dt/6.0)*(k1_omega + 2*k2_omega + 2*k3_omega + k4_omega);
-    x_out[2] = alpha + (dt/6.0)*(k1_alpha + 2*k2_alpha + 2*k3_alpha + k4_alpha);
-}
-
-// =====================================================
-// NUMERICAL JACOBIAN using CENTRAL FINITE DIFFERENCE [web:20][web:9][web:6]
-// Phi ≈ df/dx = [f(x + eps*e_i) - f(x - eps*e_i)] / (2*eps) for each column i
-// =====================================================
-
-void computeNumericalJacobian(double x[3], double dt, double g, double L, double Phi[3][3]) {
-    double x_plus[3], x_minus[3], f_plus[3], f_minus[3];
-    double x_orig[3];
-    for (int i = 0; i < 3; i++) x_orig[i] = x[i];
-
-    for (int col = 0; col < 3; col++) {
-        // +eps in column direction
-        for (int i = 0; i < 3; i++) {
-            x_plus[i] = x_orig[i];
-            x_minus[i] = x_orig[i];
-        }
-        x_plus[col] += EPS;
-        x_minus[col] -= EPS;
-
-        stateTransition(x_plus, dt, g, L, f_plus);
-        stateTransition(x_minus, dt, g, L, f_minus);
-
-        // Central difference for each row
-        for (int row = 0; row < 3; row++) {
-            Phi[row][col] = (f_plus[row] - f_minus[row]) / (2.0 * EPS);
-        }
-    }
-}
-
-// =====================================================
-// AUGMENTED LAGRANGE SOLVER (unchanged)
-// =====================================================
-
-void augmentedLagrangeStep(ALState& state, double dt,
-                          double m_A, double g, double L, double I_theta,
-                          double& lam1_out, double& lam2_out) {
-    
-    double* q = state.q;
-    double* qdot = state.qdot;
-    double* qddot = state.qddot;
-    
+// M z̈ + C_z^T λ = Q^e + Q^v
+// C_z z̈ + C_zz ż^2 = 0
+static void solveAL_z_ddot(const double z[3], const double z_dot[3],
+                           double m_A, double g, double L, double I_theta,
+                           double Q_i_theta,    // Q_i (1DOF) external torque on z3 [Eq. (38)–(40)]
+                           double z_ddot_out[3])
+{
+    // M = diag(m_A, m_A, I_theta)
     double M11 = m_A, M22 = m_A, M33 = I_theta;
-    double C11 = 1.0,  C12 = 0.0,             C13 = (L/2.0)*sin(q[2]);
-    double C21 = 0.0,  C22 = 1.0,             C23 = (L/2.0)*cos(q[2]);
-    
-    double Qe1 = 0.0, Qe2 = -m_A*g, Qe3 = 0.0;
-    double Qv1 = 0.0, Qv2 = 0.0;
-    double Qv3 = -(qdot[2]*qdot[2])*(L/2.0)*cos(q[2]);
-    
-    double cqq1 = (qdot[2]*qdot[2])*(L/2.0)*cos(q[2]);
-    double cqq2 = -(qdot[2]*qdot[2])*(L/2.0)*sin(q[2]);
-    
+
+    // C_z = [1, 0, (L/2)sin(theta); 0, 1, (L/2)cos(theta)]
+    double C11 = 1.0,  C12 = 0.0,             C13 = (L/2.0)*std::sin(z[2]);
+    double C21 = 0.0,  C22 = 1.0,             C23 = (L/2.0)*std::cos(z[2]);
+
+    // Q^e = [0; -m_A*g; 0]
+    double Qe1 = 0.0;
+    double Qe2 = -m_A * g;
+    // Qe3 includes the force correction Q_i_theta per Eq. (38)–(40)
+    double Qe3 = 0.0 + Q_i_theta; 
+
+    // Q^v_theta = -(ż3^2)*(L/2)*cos(theta)
+    double Qv1 = 0.0;
+    double Qv2 = 0.0;
+    double Qv3 = -(z_dot[2]*z_dot[2])*(L/2.0)*std::cos(z[2]);
+
+    // C_zz ż^2 = [ż3^2*(L/2)*cos(theta); -ż3^2*(L/2)*sin(theta)]
+    double Czz1 = (z_dot[2]*z_dot[2])*(L/2.0)*std::cos(z[2]);
+    double Czz2 = -(z_dot[2]*z_dot[2])*(L/2.0)*std::sin(z[2]);
+
+    // 5x5 augmented system [ M C_z^T; C_z 0 ] [z̈; λ] = [Q^e+Q^v; -C_zz]
     double A[5][5] = {
         {M11,  0.0,  0.0,  C11, C21},
         {0.0,  M22,  0.0,  C12, C22},
@@ -174,255 +115,501 @@ void augmentedLagrangeStep(ALState& state, double dt,
         {C11,  C12,  C13,  0.0, 0.0},
         {C21,  C22,  C23,  0.0, 0.0}
     };
-    
+
     double b[5] = {
-        Qe1 + Qv1, Qe2 + Qv2, Qe3 + Qv3, -cqq1, -cqq2
+        Qe1 + Qv1,
+        Qe2 + Qv2,
+        Qe3 + Qv3,
+        -Czz1,
+        -Czz2
     };
-    
-    // Gaussian elimination
-    for (int i = 0; i < 5; i++) {
+
+    // Gaussian elimination (partial pivoting)
+    for (int i = 0; i < 5; ++i) {
         int pivot = i;
-        for (int k = i+1; k < 5; k++) {
-            if (fabs(A[k][i]) > fabs(A[pivot][i])) pivot = k;
+        for (int k = i + 1; k < 5; ++k) {
+            if (std::fabs(A[k][i]) > std::fabs(A[pivot][i])) pivot = k;
         }
         if (pivot != i) {
-            for (int j = 0; j < 5; j++) {
-                double temp = A[i][j]; A[i][j] = A[pivot][j]; A[pivot][j] = temp;
-            }
-            double temp = b[i]; b[i] = b[pivot]; b[pivot] = temp;
+            for (int j = 0; j < 5; ++j) std::swap(A[i][j], A[pivot][j]);
+            std::swap(b[i], b[pivot]);
         }
-        if (fabs(A[i][i]) < 1e-12) continue;
-        for (int k = i+1; k < 5; k++) {
+        if (std::fabs(A[i][i]) < 1e-12) continue;
+        for (int k = i + 1; k < 5; ++k) {
             double factor = A[k][i] / A[i][i];
-            for (int j = i; j < 5; j++) A[k][j] -= factor * A[i][j];
+            for (int j = i; j < 5; ++j) A[k][j] -= factor * A[i][j];
             b[k] -= factor * b[i];
         }
     }
-    
+
     double sol[5];
-    for (int i = 4; i >= 0; i--) {
+    for (int i = 4; i >= 0; --i) {
         sol[i] = b[i];
-        for (int j = i+1; j < 5; j++) sol[i] -= A[i][j] * sol[j];
-        if (fabs(A[i][i]) > 1e-12) sol[i] /= A[i][i];
+        for (int j = i + 1; j < 5; ++j) sol[i] -= A[i][j] * sol[j];
+        if (std::fabs(A[i][i]) > 1e-12) sol[i] /= A[i][i];
     }
-    
-    qddot[0] = sol[0]; qddot[1] = sol[1]; qddot[2] = sol[2];
-    lam1_out = sol[3]; lam2_out = sol[4];
-    
-    qdot[0] += qddot[0] * dt; qdot[1] += qddot[1] * dt; qdot[2] += qddot[2] * dt;
-    q[0] += qdot[0] * dt; q[1] += qdot[1] * dt; q[2] += qdot[2] * dt;
+
+    z_ddot_out[0] = sol[0];
+    z_ddot_out[1] = sol[1];
+    z_ddot_out[2] = sol[2];
 }
 
-void rk4Step(ALState& state, double dt, double m_A, double g, double L, double I_theta) {
-    double dummy_lam1, dummy_lam2;
-    augmentedLagrangeStep(state, dt, m_A, g, L, I_theta, dummy_lam1, dummy_lam2);
+// ODE: ẏ = [ż; z̈]
+static void augmentedLagrangeODE(const double y[6],
+                                 double m_A, double g, double L, double I_theta,
+                                 double Q_i_theta,
+                                 double dydt[6])
+{
+    double z[3]      = {y[0], y[1], y[2]};
+    double z_dot[3]  = {y[3], y[4], y[5]};
+    double z_ddot[3];
+
+    solveAL_z_ddot(z, z_dot, m_A, g, L, I_theta, Q_i_theta, z_ddot);
+
+    dydt[0] = z_dot[0];
+    dydt[1] = z_dot[1];
+    dydt[2] = z_dot[2];
+    dydt[3] = z_ddot[0];
+    dydt[4] = z_ddot[1];
+    dydt[5] = z_ddot[2];
 }
 
-// =====================================================
-// IKF PREDICT WITH NUMERICAL 3x3 JACOBIAN [web:1][web:2]
-// =====================================================
-
-void ikfPredict(IKFState* ikf, double dt, double m_A, double g, double L, double I_theta) {
-    // Copy current state to temp for prediction
-    double x_temp[3];
-    for (int i = 0; i < 3; i++) x_temp[i] = ikf->x[i];
-
-    // Predict state using RK4 transition
-    stateTransition(x_temp, dt, g, L, ikf->x_pred);
-
-    // ========== NUMERICAL JACOBIAN Phi ==========
-    double Phi[3][3];
-    computeNumericalJacobian(x_temp, dt, g, L, Phi);
-
-    // ========== COVARIANCE PREDICTION P = Phi * P * Phi^T + Q ==========
-    double P_temp[3][3];
-    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) P_temp[i][j] = ikf->P[i][j];
-
-    double P_pred[3][3] = {0};
-    // Phi * P
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            for (int k = 0; k < 3; k++) {
-                P_pred[i][j] += Phi[i][k] * P_temp[k][j];
-            }
-        }
-    }
-
-    // P * Phi^T
-    double P_final[3][3] = {0};
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            for (int k = 0; k < 3; k++) {
-                P_final[i][j] += P_pred[i][k] * Phi[k][j];
-            }
-        }
-    }
-
-    double Q[3][3] = {{1e-6, 0, 0}, {0, 1e-5, 0}, {0, 0, 1e-4}};  // Process noise
-
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            ikf->P[i][j] = P_final[i][j] + Q[i][j];
-        }
-    }
-}
-
-// =====================================================
-// 3x3 IKF UPDATE (IMPROVED with full matrix inversion approx) [web:1]
-// =====================================================
-
-void ikfUpdate(IKFState* ikf, double z_theta, double z_omega, double z_alpha) {
-    // H = I (3x3 identity for direct measurements)
-    double R[3][3] = {{1e-8, 0, 0}, {0, 1e-7, 0}, {0, 0, 1e-6}};  // Measurement noise
-
-    // Innovation y = z - H*x_pred = z - x_pred
-    double y[3] = {
-        z_theta - ikf->x_pred[0],
-        z_omega - ikf->x_pred[1], 
-        z_alpha - ikf->x_pred[2]
+// True RK4 step
+static void rk4Step(ALState &state, double dt,
+                    double m_A, double g, double L, double I_theta,
+                    double Q_i_theta)
+{
+    double y[6] = {
+        state.z[0], state.z[1], state.z[2],
+        state.z_dot[0], state.z_dot[1], state.z_dot[2]
     };
 
-    // S = P + R (H=I)
-    double S[3][3];
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            S[i][j] = ikf->P[i][j] + R[i][j];
-        }
+    double k1[6], k2[6], k3[6], k4[6], yt[6];
+
+    augmentedLagrangeODE(y, m_A, g, L, I_theta, Q_i_theta, k1);
+
+    for (int i = 0; i < 6; ++i) yt[i] = y[i] + 0.5 * dt * k1[i];
+    augmentedLagrangeODE(yt, m_A, g, L, I_theta, Q_i_theta, k2);
+
+    for (int i = 0; i < 6; ++i) yt[i] = y[i] + 0.5 * dt * k2[i];
+    augmentedLagrangeODE(yt, m_A, g, L, I_theta, Q_i_theta, k3);
+
+    for (int i = 0; i < 6; ++i) yt[i] = y[i] + dt * k3[i];
+    augmentedLagrangeODE(yt, m_A, g, L, I_theta, Q_i_theta, k4);
+
+    for (int i = 0; i < 6; ++i) {
+        y[i] = y[i] + (dt / 6.0) * (k1[i] + 2.0*k2[i] + 2.0*k3[i] + k4[i]);
     }
 
-    // Kalman gain K = P * inv(S) ≈ diagonal dominant for stability [web:1]
-    double K[3][3];
-    for (int i = 0; i < 3; i++) {
-        double S_ii = S[i][i] + 1e-12;  // Avoid division by zero
-        for (int j = 0; j < 3; j++) {
-            K[i][j] = ikf->P[i][j] / S_ii;
-        }
-    }
+    // write back z and ż
+    state.z[0] = y[0]; state.z[1] = y[1]; state.z[2] = y[2];
+    state.z_dot[0] = y[3]; state.z_dot[1] = y[4]; state.z_dot[2] = y[5];
 
-    // State update x = x_pred + K*y
-    for (int i = 0; i < 3; i++) {
-        ikf->x[i] = ikf->x_pred[i];
-        for (int j = 0; j < 3; j++) {
-            ikf->x[i] += K[i][j] * y[j];
-        }
-    }
-
-    // Joseph form covariance update (I - K*H)*P*(I - K*H)^T + K*R*K^T ≈ conservative scaling
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            ikf->P[i][j] *= 0.95;
-            if (i == j) ikf->P[i][j] = fmax(ikf->P[i][j], 1e-10);
-        }
-    }
+    // update z̈ for logging
+    double z_ddot_now[3];
+    double z_now[3]      = {state.z[0], state.z[1], state.z[2]};
+    double z_dot_now[3]  = {state.z_dot[0], state.z_dot[1], state.z_dot[2]};
+    solveAL_z_ddot(z_now, z_dot_now, m_A, g, L, I_theta, Q_i_theta, z_ddot_now);
+    state.z_ddot[0] = z_ddot_now[0];
+    state.z_ddot[1] = z_ddot_now[1];
+    state.z_ddot[2] = z_ddot_now[2];
 }
 
-// =====================================================
-// CSV and MAIN (updated initialization for P)
-// =====================================================
+// ======================================================
+// IKF (Indirect  Kalman filter) 
+// ======================================================
 
-void saveToCSV() {
-    std::ofstream csv("AL_IKF_NUMERICAL_results.csv");
-    csv << "Time(s),Theta_MATLAB,Omega_MATLAB,Alpha_MATLAB,Torque_MATLAB,"
-              "Theta_CPP,Omega_CPP,Alpha_CPP,Theta_IKF,Omega_IKF,Alpha_IKF,CycleTime_us\n";
-    for (size_t i = 0; i < logData.time.size(); i++) {
+// Eq. (20): State transition matrix f_x for [dz_i, dz_i_dot, dz_i_ddot]
+static void buildFx_fullEq20(double dt,
+                             const double z_i_ref[3], const double z_i_dot_ref[3],
+                             double m_A, double g, double L, double I_theta,
+                             double Q_i_theta,
+                             double f_x[3][3])
+{
+    const double eps = 1e-8;
+
+    double z_ddot0[3], z_ddot_theta[3], z_ddot_omega[3];
+    solveAL_z_ddot(z_i_ref, z_i_dot_ref, m_A, g, L, I_theta, Q_i_theta, z_ddot0);
+
+    // Perturb z3 (theta)
+    double z_th[3] = {z_i_ref[0], z_i_ref[1], z_i_ref[2] + eps};
+    solveAL_z_ddot(z_th, z_i_dot_ref, m_A, g, L, I_theta, Q_i_theta, z_ddot_theta);
+
+    // Perturb ż3 (omega)
+    double z_dot_om[3] = {z_i_dot_ref[0], z_i_dot_ref[1], z_i_dot_ref[2] + eps};
+    solveAL_z_ddot(z_i_ref, z_dot_om, m_A, g, L, I_theta, Q_i_theta, z_ddot_omega);
+
+    const double z_ddot_alpha0 = z_ddot0[2];
+    const double d_z_ddot_d_z      = (z_ddot_theta[2] - z_ddot_alpha0) / eps; // ∂z̈/∂z  [Eq. (20)]
+    const double d_z_ddot_d_z_dot  = (z_ddot_omega[2] - z_ddot_alpha0) / eps; // ∂z̈/∂ż [Eq. (20)]
+
+    const double dt2 = dt * dt;
+
+    // Eq. (20) exact structure specialized to 1DOF
+    f_x[0][0] = 1.0 + 0.5 * d_z_ddot_d_z     * dt2;
+    f_x[0][1] = dt  + 0.5 * d_z_ddot_d_z_dot * dt2;
+    f_x[0][2] = 0.5 * dt2;
+
+    // Velocity error row
+    f_x[1][0] = d_z_ddot_d_z     * dt;
+    f_x[1][1] = 1.0 + d_z_ddot_d_z_dot * dt;
+    f_x[1][2] = dt;
+
+    // Acceleration error row
+    f_x[2][0] = 0.0;
+    f_x[2][1] = 0.0;
+    f_x[2][2] = 1.0;
+}
+
+// Ξ matrix: only acceleration-level plant noise (1DOF Eq. (21))
+static void buildXi(double sigma_z_ddot_i_sq, double Xi[3][3])
+{
+    // Eq. (21) specialized: Ξ = diag(0, 0, σ^2_{z̈,i})
+    Xi[0][0] = 0.0; Xi[0][1] = 0.0; Xi[0][2] = 0.0;
+    Xi[1][0] = 0.0; Xi[1][1] = 0.0; Xi[1][2] = 0.0;
+    Xi[2][0] = 0.0; Xi[2][1] = 0.0; Xi[2][2] = sigma_z_ddot_i_sq;
+}
+
+// Predict step: x^- = 0 [Eq. (18)], P^- = f_x P f_x^T + Ξ [Eq. (19)]
+static void ikfPredict(IKFState &ikf, double dt, double sigma_z_ddot_i_sq,
+                       const double z_i_ref[3], const double z_i_dot_ref[3],
+                       double m_A, double g, double L, double I_theta,
+                       double Q_i_theta)
+{
+    double f_x[3][3], Xi[3][3];
+    buildFx_fullEq20(dt, z_i_ref, z_i_dot_ref, m_A, g, L, I_theta, Q_i_theta, f_x); // Eq. (20)
+    buildXi(sigma_z_ddot_i_sq, Xi);                                                 // Eq. (21)
+
+    // Eq. (18): x^- = 0
+    ikf.x_pred[0] = 0.0;
+    ikf.x_pred[1] = 0.0;
+    ikf.x_pred[2] = 0.0;
+
+    // Eq. (19): P^- = f_x P f_x^T + Ξ
+    double fP[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            for (int k = 0; k < 3; ++k)
+                fP[i][j] += f_x[i][k] * ikf.P[k][j];
+
+    double f_x_T[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            f_x_T[i][j] = f_x[j][i];
+
+    double Pp[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            for (int k = 0; k < 3; ++k)
+                Pp[i][j] += fP[i][k] * f_x_T[k][j];
+
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            ikf.P_pred[i][j] = Pp[i][j] + Xi[i][j];
+}
+
+// Update using ONLY z and ż measurements (no z̈ measurement).
+// h_x maps which sensors are used [Eq. (27)–(29)].
+static void ikfUpdate_z_zdot_only(IKFState &ikf,
+                                  double z_i_ref_scalar, double z_i_dot_ref_scalar,
+                                  double z_meas_scalar,   double z_dot_meas_scalar,
+                                  double sigma_z_meas_sq, double sigma_z_dot_meas_sq)
+{
+    // y = o - h(z) [Eq. (22)] with o=[z_meas, ż_meas], h=[z_ref, ż_ref]
+    double y[2] = { z_meas_scalar - z_i_ref_scalar,
+                    z_dot_meas_scalar - z_i_dot_ref_scalar };
+
+    // Measurement Jacobian h_x for [z, ż] only: H = [1 0 0; 0 1 0]
+    double H[2][3] = { {1.0, 0.0, 0.0},
+                       {0.0, 1.0, 0.0} };
+
+    // Σ (measurement covariance) [Eq. (23)] subset of Eq. (29)
+    double Sigma[2][2] = { {sigma_z_meas_sq, 0.0},
+                           {0.0,             sigma_z_dot_meas_sq} };
+
+    // S = H P^- H^T + Σ [Eq. (23)]
+    double S00 = ikf.P_pred[0][0] + Sigma[0][0];
+    double S01 = ikf.P_pred[0][1] + Sigma[0][1];
+    double S10 = ikf.P_pred[1][0] + Sigma[1][0];
+    double S11 = ikf.P_pred[1][1] + Sigma[1][1];
+
+    double detS = S00*S11 - S01*S10;
+    if (std::fabs(detS) < 1e-18) detS = (detS >= 0.0 ? 1e-18 : -1e-18);
+
+    double invS00 =  S11 / detS;
+    double invS01 = -S01 / detS;
+    double invS10 = -S10 / detS;
+    double invS11 =  S00 / detS;
+
+    // K = P^- H^T S^{-1} [Eq. (24)]
+    double K[3][2];
+
+    // P^- H^T = [col0 col1] of P_pred
+    double PHT0[3] = { ikf.P_pred[0][0], ikf.P_pred[1][0], ikf.P_pred[2][0] };
+    double PHT1[3] = { ikf.P_pred[0][1], ikf.P_pred[1][1], ikf.P_pred[2][1] };
+
+    for (int i = 0; i < 3; ++i) {
+        K[i][0] = PHT0[i]*invS00 + PHT1[i]*invS10;
+        K[i][1] = PHT0[i]*invS01 + PHT1[i]*invS11;
+    }
+
+    // x = 0 + K y [Eq. (25)] (x_pred is 0 by Eq. (18))
+    ikf.x[0] = ikf.x_pred[0] + K[0][0]*y[0] + K[0][1]*y[1];
+    ikf.x[1] = ikf.x_pred[1] + K[1][0]*y[0] + K[1][1]*y[1];
+    ikf.x[2] = ikf.x_pred[2] + K[2][0]*y[0] + K[2][1]*y[1];
+
+    // P = (I - K H) P^- [Eq. (26)]
+    double I_minus_KH[3][3] = {
+        {1.0 - K[0][0],     -K[0][1],        0.0},
+        {    -K[1][0], 1.0 - K[1][1],        0.0},
+        {    -K[2][0],     -K[2][1],        1.0}
+    };
+
+    double P_new[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            for (int k = 0; k < 3; ++k)
+                P_new[i][j] += I_minus_KH[i][k] * ikf.P_pred[k][j];
+
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            ikf.P[i][j] = P_new[i][j];
+}
+
+// ======================================================
+// CSV
+// ======================================================
+
+static void saveToCSV() {
+    std::ofstream csv("AL_IKF_results_Num.csv");
+    csv << "Time,Theta_MATLAB,Omega_MATLAB,Alpha_MATLAB,"
+           "Theta_CPP,Omega_CPP,Alpha_CPP,"
+           "Theta_IKF,Omega_IKF,Alpha_IKF,CycleTime_us\n";
+
+    for (size_t i = 0; i < logData.time.size(); ++i) {
         csv << std::fixed << std::setprecision(6)
-            << logData.time[i] << "," << logData.theta_matlab[i] << "," 
-            << logData.omega_matlab[i] << "," << logData.alpha_matlab[i] << ","
-            << logData.torque_matlab[i] << "," << logData.theta_cpp[i] << ","
-            << logData.omega_cpp[i] << "," << logData.alpha_cpp[i] << ","
-            << logData.theta_ikf[i] << "," << logData.omega_ikf[i] << ","
-            << logData.alpha_ikf[i] << "," << logData.cycle_time_us[i] << "\n";
+            << logData.time[i] << ","
+            << logData.theta_m[i] << ","
+            << logData.omega_m[i] << ","
+            << logData.alpha_m[i] << ","
+            << logData.theta_cpp[i] << ","
+            << logData.omega_cpp[i] << ","
+            << logData.alpha_cpp[i] << ","
+            << logData.theta_ikf[i] << ","
+            << logData.omega_ikf[i] << ","
+            << logData.alpha_ikf[i] << ","
+            << logData.cycle_us[i] << "\n";
     }
+
     csv.close();
-    std::cout << "\nSaved " << logData.time.size() << " samples to AL_IKF_NUMERICAL_results.csv\n";
+    std::cout << "\nSaved " << logData.time.size()
+              << " samples to AL_IKF_results_Num.csv\n";
 }
+
+// ======================================================
+// MAIN
+// ======================================================
 
 int main() {
-    // System params
-    const double L = 1.0, w = 0.1, h = 0.1, rho = 7850, g = 9.81;
-    const double m_A = rho*L*w*h;
-    const double I_theta = m_A*L*L/12.0;
-    const double dt_tcp = 0.001;
-    const double dt_sub = dt_tcp / 10;
-    
-    // Initialize states
-    ALState al_state = {};
-    al_state.q[0] = 0.1; al_state.q[1] = 0.0; al_state.q[2] = PI/6.0;
-    al_state.qdot[0] = 0.0; al_state.qdot[1] = 0.0; al_state.qdot[2] = 0.5;
-    
-    IKFState ikf_state = {};
-    ikf_state.x[0] = PI/6.0; ikf_state.x[1] = 0.5; ikf_state.x[2] = -1.0;
-    // Initialize P with reasonable diagonals
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            ikf_state.P[i][j] = (i == j) ? 1e-4 : 0.0;
-        }
-    }
-    
-    // TCP setup
+    // System parameters 
+    const double L   = 1.0;
+    const double w   = 0.1;
+    const double h   = 0.1;
+    const double rho = 7850.0;
+    const double g   = 9.81;
+
+
+
+    const double m_A     = rho * L * w * h;
+    const double I_theta = m_A * L * L / 12.0;
+
+
+
+    const double dt_tcp = 0.001;        // 1 kHz
+    const double dt_sub = dt_tcp / 10;  // AL plant substep count = 10
+
+    // 1) PURE MODEL (Uncorrected, for logging/comparison)
+    ALState al_pure{};
+    al_pure.z[0] = 0.0;  al_pure.z[1] = 0.0;  al_pure.z[2] = PI/3.0;
+    al_pure.z_dot[0] = 0.0; al_pure.z_dot[1] = 0.0; al_pure.z_dot[2] = 0.0;
+    al_pure.z_ddot[0] = al_pure.z_ddot[1] = al_pure.z_ddot[2] = 0.0;
+
+    // 2) ESTIMATION MODEL (Corrected by IKF, used for feedback)
+    ALState al_est{};
+    al_est.z[0] = 0.0;  al_est.z[1] = 0.0;  al_est.z[2] = PI/3.0;
+    al_est.z_dot[0] = 0.0; al_est.z_dot[1] = 0.0; al_est.z_dot[2] = 0.0;
+    al_est.z_ddot[0] = al_est.z_ddot[1] = al_est.z_ddot[2] = 0.0;
+
+    // Init IKF (error state starts at 0)
+    IKFState ikf{};
+    ikf.x[0] = 0.0; ikf.x[1] = 0.0; ikf.x[2] = 0.0;
+
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            ikf.P[i][j] = 0.0;
+
+    ikf.P[0][0] = 1e-3;
+    ikf.P[1][1] = 1e-3;
+    ikf.P[2][2] = 1e-2;
+
+    // FORCE CORRECTION [Eq. (38)–(40)] but in here no force used
+    double Q_i_theta_total = 0.0;   // accumulated Q_i on the joint (1DOF)
+
+    // TCP server
     const int serverPort = 5000;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = {};
+    if (sock < 0) {
+        std::cerr << "Socket creation failed\n";
+        return -1;
+    }
+
+    sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(serverPort);
+    addr.sin_port   = htons(serverPort);
     addr.sin_addr.s_addr = INADDR_ANY;
-    
-    bind(sock, (struct sockaddr*)&addr, sizeof(addr));
+
+    if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "Bind failed\n";
+        close(sock);
+        return -1;
+    }
+
     listen(sock, 1);
     std::cout << "Waiting for MATLAB...\n";
-    
+
     int client = accept(sock, NULL, NULL);
-    std::cout << "MATLAB connected! Running 3-state IKF with NUMERICAL JACOBIAN\n\n";
-    
-    int sampleCount = 0;
+    if (client < 0) {
+        std::cerr << "Accept failed\n";
+        close(sock);
+        return -1;
+    }
+
+    std::cout << "MATLAB connected! Dual-State + STRICT Eq(20/35) + FORCE CORRECTION (Eq 38-40)\n\n";
+
+    int k = 0;
     while (true) {
-        auto start = std::chrono::high_resolution_clock::now();
-        
-        double theta_m, omega_m, alpha_m, torque_m;
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        // MATLAB sends theta_m, omega_m, alpha_m (3 doubles)
+        double theta_m, omega_m, alpha_m;
         if (recv(client, &theta_m, sizeof(double), 0) <= 0) break;
         if (recv(client, &omega_m, sizeof(double), 0) <= 0) break;
         if (recv(client, &alpha_m, sizeof(double), 0) <= 0) break;
-        if (recv(client, &torque_m, sizeof(double), 0) <= 0) break;
-        
-        theta_m = swapDouble(theta_m); omega_m = swapDouble(omega_m);
-        alpha_m = swapDouble(alpha_m); torque_m = swapDouble(torque_m);
-        
-        sampleCount++;
-        
-        // AL simulation (10 substeps)
-        for (int i = 0; i < 10; i++) {
-            rk4Step(al_state, dt_sub, m_A, g, L, I_theta);
+
+        theta_m = swapDouble(theta_m);
+        omega_m = swapDouble(omega_m);
+        alpha_m = swapDouble(alpha_m);
+
+        ++k;
+        double t = k * dt_tcp;
+
+        // =================================================
+        // 1) Step Pure AL Model 
+        // =================================================
+        for (int i = 0; i < 10; ++i) {
+            rk4Step(al_pure, dt_sub, m_A, g, L, I_theta, 0.0); // No force correction
         }
-        
-        // IKF PREDICT + UPDATE with NUMERICAL JACOBIAN
-        ikfPredict(&ikf_state, dt_tcp, m_A, g, L, I_theta);
-        ikfUpdate(&ikf_state, theta_m, omega_m, alpha_m);
-        
-        // Log
-        double t = sampleCount * dt_tcp;
+
+        // Pure mechanics 
+        double theta_pure_cpp = al_pure.z[2];
+        double omega_pure_cpp = al_pure.z_dot[2];
+        double alpha_pure_cpp = al_pure.z_ddot[2];
+
+        // =================================================
+        // 2) Step Estimation Model (Corrected by IKF)
+        // =================================================
+        for (int i = 0; i < 10; ++i) {
+            // Apply accumulated force correction to sustain acceleration prediction
+            rk4Step(al_est, dt_sub, m_A, g, L, I_theta, Q_i_theta_total);
+        }
+
+        // Reference (mechanics model) states for IKF
+        double z_i_ref[3]      = {al_est.z[0],     al_est.z[1],     al_est.z[2]};
+        double z_i_dot_ref[3]  = {al_est.z_dot[0], al_est.z_dot[1], al_est.z_dot[2]};
+        double z_i_ref_scalar      = al_est.z[2];
+        double z_i_dot_ref_scalar  = al_est.z_dot[2];
+        double z_i_ddot_ref_scalar = al_est.z_ddot[2];
+
+        // IKF Predict & Update
+        const double sigma_z_ddot_i_sq = 0.00001; // σ^2_{z̈,i} plant noise
+        ikfPredict(ikf, dt_tcp, sigma_z_ddot_i_sq,
+                   z_i_ref, z_i_dot_ref, m_A, g, L, I_theta, Q_i_theta_total);
+
+        const double sigma_z_meas_sq     = 1e-8; // σ^2_z
+        const double sigma_z_dot_meas_sq = 1e-7; // σ^2_{ż}
+        ikfUpdate_z_zdot_only(ikf,
+                              z_i_ref_scalar,     z_i_dot_ref_scalar,
+                              theta_m,            omega_m,
+                              sigma_z_meas_sq,    sigma_z_dot_meas_sq);
+
+        // ===================================================================
+        // 3) Apply Corrections to al_est ONLY (Eqs. (31), (32), (35))
+        // ===================================================================
+
+        // x = [dz_i, dz_i_dot, dz_i_ddot]
+        double dz_i      = ikf.x[0];
+        double dz_i_dot  = ikf.x[1];
+        double dz_i_ddot = ikf.x[2];
+
+        double z_i_corr_scalar      = z_i_ref_scalar      + dz_i;      // corrected z_i
+        double z_i_dot_corr_scalar  = z_i_dot_ref_scalar  + dz_i_dot;  // corrected ż_i
+        double z_i_ddot_corr_scalar = z_i_ddot_ref_scalar + dz_i_ddot; // corrected z̈_i
+
+        // ===================================================================
+        // NEW: FORCE CORRECTION [Eq. (38)–(40)]
+        // For 1DOF: I_theta * dz̈_i = ΔQ_i_theta
+        // ===================================================================
+        double Delta_Q_i_theta = I_theta * dz_i_ddot;
+
+        // Persistently update the external force model Q_i
+        Q_i_theta_total += Delta_Q_i_theta;
+
+        // Update Estimation Model (independent coordinate)
+        al_est.z[2]      = z_i_corr_scalar;
+        al_est.z_dot[2]  = z_i_dot_corr_scalar;
+        al_est.z_ddot[2] = z_i_ddot_corr_scalar;
+
+        // Reset error states (indirect filter)
+        ikf.x[0] = 0.0;
+        ikf.x[1] = 0.0;
+        ikf.x[2] = 0.0;
+
+        // ===================================================================
+        // 4) Logging
+        // ===================================================================
+
         logData.time.push_back(t);
-        logData.theta_matlab.push_back(theta_m);
-        logData.omega_matlab.push_back(omega_m);
-        logData.alpha_matlab.push_back(alpha_m);
-        logData.torque_matlab.push_back(torque_m);
-        logData.theta_cpp.push_back(al_state.q[2]);
-        logData.omega_cpp.push_back(al_state.qdot[2]);
-        logData.alpha_cpp.push_back(al_state.qddot[2]);
-        logData.theta_ikf.push_back(ikf_state.x[0]);
-        logData.omega_ikf.push_back(ikf_state.x[1]);
-        logData.alpha_ikf.push_back(ikf_state.x[2]);
-        
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::high_resolution_clock::now() - start);
-        logData.cycle_time_us.push_back(duration.count());
-        
-        if (sampleCount % 100 == 0) {
-            printf("[t=%.3f] alpha: MATLAB=%.2f, CPP=%.2f, IKF=%.2f | Cycle=%.1f us\n",
-            t, alpha_m, al_state.qddot[2], ikf_state.x[2], (double)duration.count());
-}
+
+        // MATLAB Input
+        logData.theta_m.push_back(theta_m);
+        logData.omega_m.push_back(omega_m);
+        logData.alpha_m.push_back(alpha_m);
+
+        // CPP (Pure Open-Loop)
+        logData.theta_cpp.push_back(theta_pure_cpp);
+        logData.omega_cpp.push_back(omega_pure_cpp);
+        logData.alpha_cpp.push_back(alpha_pure_cpp);
+
+        // IKF (Corrected Feedback Loop)
+        logData.theta_ikf.push_back(z_i_corr_scalar);
+        logData.omega_ikf.push_back(z_i_dot_corr_scalar);
+        logData.alpha_ikf.push_back(z_i_ddot_corr_scalar);
+
+        auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::high_resolution_clock::now() - t_start).count();
+        logData.cycle_us.push_back(static_cast<double>(dt_us));
+
+        if (k % 1000 == 0) {
+            std::printf(
+                "t=%.3f: theta_m=%.4f | theta_pure=%.4f | theta_est=%.4f (alpha_est=%.4f) | Q_i_theta_total=%.4f\n",
+                t, theta_m, theta_pure_cpp, z_i_corr_scalar, z_i_ddot_corr_scalar, Q_i_theta_total);
+        }
     }
-    
-    close(client); close(sock);
+
+    close(client);
+    close(sock);
+
     saveToCSV();
     return 0;
 }
+
